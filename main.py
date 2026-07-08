@@ -9,6 +9,7 @@ from core.chat import MessageChain
 from core.chat.message_elements import Text
 from core.persona import PersonaManager
 from core.prompt_manager import Prompt
+from core.utils.tool_utils import BaseTool
 
 from .state_manager import StateManager
 from .trigger import TriggerEngine
@@ -29,6 +30,7 @@ class PersonaProgressionPlugin(BasePlugin):
         self.stage_map: Dict[int, str] = {}
         self.initial_stage = 0
         self.enable_debug_log = False
+        self.enabled_sessions: List[str] = []
 
         # 触发配置
         self.trigger_interval = 10
@@ -75,6 +77,7 @@ class PersonaProgressionPlugin(BasePlugin):
         self.total_stages = basic.get("total_stages", 5)
         self.initial_stage = basic.get("initial_stage", 0)
         self.enable_debug_log = basic.get("enable_debug_log", False)
+        self.enabled_sessions = [s.strip() for s in basic.get("enabled_sessions", []) if s.strip()]
 
         self.persona_mgr = self.ctx.persona_mgr
         all_personas = await self.persona_mgr.list_personas()
@@ -153,12 +156,12 @@ class PersonaProgressionPlugin(BasePlugin):
         self.advance_keywords = [kw.strip().lower() for kw in manual.get("advance_keywords", ["/进阶", "/升级"]) if kw.strip()]
         self.decay_keywords = [kw.strip().lower() for kw in manual.get("decay_keywords", ["/降级", "/退阶"]) if kw.strip()]
         self.clear_keywords = [kw.strip().lower() for kw in manual.get("clear_keywords", ["/消级", "/清数"]) if kw.strip()]
-        self.enable_tool = manual.get("enable_tool", True)
         self.reset_on_manual = manual.get("reset_on_manual", False)
         self.clear_context_on_switch = manual.get("clear_context_on_switch", False)  # ✅ 新增
 
         # 权限与反馈
         perm = cfg.get("section_permission", {})
+        self.enable_tool = perm.get("enable_tool", True)
         self.enable_permission = perm.get("enable_permission", False)
         self.allowed_users = [str(uid).strip() for uid in perm.get("allowed_users", []) if str(uid).strip()]
         self.permission_denied_message = perm.get("permission_denied_message", "❌ 权限不足：您没有权限切换人格阶段")
@@ -209,6 +212,12 @@ class PersonaProgressionPlugin(BasePlugin):
         if hasattr(event, "session") and hasattr(event.session, "sid"):
             return event.session.sid
         return "default"
+
+    def _is_session_enabled(self, session_id: str) -> bool:
+        """检查会话是否在白名单中，白名单为空则全部启用"""
+        if not self.enabled_sessions:
+            return True
+        return session_id in self.enabled_sessions
 
     # ---------- 核心逻辑 ----------
     async def _change_stage(self, session_id: str, new_stage: int) -> bool:
@@ -334,6 +343,8 @@ class PersonaProgressionPlugin(BasePlugin):
         if not self.enabled:
             return
         session_id = event.sid
+        if not self._is_session_enabled(session_id):
+            return
         self.state_mgr.increment_turn(session_id)
         turn = self.state_mgr.get_turn_counter(session_id)
         if self.enable_debug_log:
@@ -354,6 +365,10 @@ class PersonaProgressionPlugin(BasePlugin):
             return
         text_lower = text.strip().lower()
         session_id = event.session.sid
+
+        # 白名单过滤：未在白名单中的会话不处理关键词
+        if not self._is_session_enabled(session_id):
+            return
 
         # 清空计数（无需权限）
         if text_lower in self.clear_keywords:
@@ -426,130 +441,27 @@ class PersonaProgressionPlugin(BasePlugin):
             event.stop()
             return
 
-    # ---------- LLM 工具 ----------
-    @register.tool(
-        name="persona_get_stage",
-        description="获取当前会话的人格阶段",
-        params={"type": "object", "properties": {}}
-    )
-    async def tool_get_stage(self, event: KiraMessageBatchEvent, *_) -> str:
-        if not self.state_mgr:
-            return "插件未初始化"
+    # ---------- LLM 工具动态注入 ----------
+    @on.llm_request(priority=Priority.MEDIUM)
+    async def inject_tools(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
+        if not self.enabled or not self.enable_tool:
+            return
         session_id = event.sid
-        stage = self.state_mgr.get_stage(session_id, self.initial_stage)
-        return f"当前阶段：{stage} / {self.total_stages - 1}"
-
-    @register.tool(
-        name="persona_set_stage",
-        description="手动设置当前会话的人格阶段",
-        params={
-            "type": "object",
-            "properties": {
-                "stage": {"type": "integer", "description": "目标阶段（0 ~ max）"}
-            },
-            "required": ["stage"]
-        }
-    )
-    async def tool_set_stage(self, event: KiraMessageBatchEvent, *_, stage: int) -> str:
-        if not self.state_mgr:
-            return "插件未初始化"
-        if not self._check_permission(event):
-            return self.permission_denied_message
-
-        session_id = event.sid
-        if stage < 0 or stage >= self.total_stages:
-            return f"阶段必须在 0 ~ {self.total_stages - 1} 之间"
-        old = self.state_mgr.get_stage(session_id, self.initial_stage)
-        ok = await self._change_stage(session_id, stage)
-        if ok:
-            if self.reset_on_manual:
-                self.state_mgr.reset_turn_counter(session_id)
-            if self.enable_debug_log:
-                logger.debug("工具 set_stage: %s 阶段 %d -> %d", session_id, old, stage)
-            return self.success_message.format(action="设置", stage=stage)
-        else:
-            return self.error_message.format(error="设置失败，请检查人格映射")
-
-    @register.tool(
-        name="persona_advance",
-        description="手动将当前会话阶段提升一级",
-        params={"type": "object", "properties": {}}
-    )
-    async def tool_advance(self, event: KiraMessageBatchEvent, *_) -> str:
-        if not self.state_mgr:
-            return "插件未初始化"
-        if not self._check_permission(event):
-            return self.permission_denied_message
-
-        session_id = event.sid
-        current = self.state_mgr.get_stage(session_id, self.initial_stage)
-        if current >= self.total_stages - 1:
-            return self.max_stage_message.format(
-                max_stage=self.total_stages - 1,
-                current_stage=current
-            )
-        new = current + 1
-        ok = await self._change_stage(session_id, new)
-        if ok:
-            if self.reset_on_manual:
-                self.state_mgr.reset_turn_counter(session_id)
-            if self.enable_debug_log:
-                logger.debug("工具 advance: %s 阶段 %d -> %d", session_id, current, new)
-            return self.success_message.format(action="进阶", stage=new)
-        else:
-            return self.error_message.format(error="升级失败，请检查人格映射")
-
-    @register.tool(
-        name="persona_decay",
-        description="手动将当前会话阶段降低一级",
-        params={"type": "object", "properties": {}}
-    )
-    async def tool_decay(self, event: KiraMessageBatchEvent, *_) -> str:
-        if not self.state_mgr:
-            return "插件未初始化"
-        if not self._check_permission(event):
-            return self.permission_denied_message
-
-        session_id = event.sid
-        current = self.state_mgr.get_stage(session_id, self.initial_stage)
-        if current <= 0:
-            return self.min_stage_message.format(
-                min_stage=0,
-                current_stage=current
-            )
-        new = current - 1
-        ok = await self._change_stage(session_id, new)
-        if ok:
-            if self.reset_on_manual:
-                self.state_mgr.reset_turn_counter(session_id)
-            if self.enable_debug_log:
-                logger.debug("工具 decay: %s 阶段 %d -> %d", session_id, current, new)
-            return self.success_message.format(action="降级", stage=new)
-        else:
-            return self.error_message.format(error="降级失败，请检查人格映射")
-
-    @register.tool(
-        name="persona_reset_counter",
-        description="重置当前会话的轮数计数器（不影响阶段）",
-        params={"type": "object", "properties": {}}
-    )
-    async def tool_reset_counter(self, event: KiraMessageBatchEvent, *_) -> str:
-        if not self.state_mgr:
-            return "插件未初始化"
-        if not self._check_permission(event):
-            return self.permission_denied_message
-
-        session_id = event.sid
-        self.state_mgr.reset_turn_counter(session_id)
-        if self.enable_debug_log:
-            logger.debug("工具 reset_counter: %s 计数器已重置", session_id)
-        return "轮数计数器已重置"
+        if not self._is_session_enabled(session_id):
+            return
+        req.tool_set.add(_PersonaGetStageTool(self.ctx, self))
+        req.tool_set.add(_PersonaSetStageTool(self.ctx, self))
+        req.tool_set.add(_PersonaAdvanceTool(self.ctx, self))
+        req.tool_set.add(_PersonaDecayTool(self.ctx, self))
+        req.tool_set.add(_PersonaResetCounterTool(self.ctx, self))
 
     # ---------- HTTP API ----------
     @register.api(method="GET", path="/stage", auth=True)
     async def api_get_stage(self, session_id: str) -> dict:
         if not self.state_mgr:
             return {"error": "not initialized"}
+        if not self._is_session_enabled(session_id):
+            return {"error": "session not enabled"}
         stage = self.state_mgr.get_stage(session_id, self.initial_stage)
         return {"stage": stage, "max": self.total_stages - 1}
 
@@ -561,6 +473,8 @@ class PersonaProgressionPlugin(BasePlugin):
         stage = body.get("stage")
         if not session_id or stage is None:
             return {"error": "missing session_id or stage"}
+        if not self._is_session_enabled(session_id):
+            return {"error": "session not enabled"}
         try:
             stage = int(stage)
         except:
@@ -579,6 +493,8 @@ class PersonaProgressionPlugin(BasePlugin):
     async def api_get_current_persona(self, session_id: str) -> dict:
         if not self.state_mgr:
             return {"error": "not initialized"}
+        if not self._is_session_enabled(session_id):
+            return {"error": "session not enabled"}
         stage = self.state_mgr.get_stage(session_id, self.initial_stage)
         persona_id = self.stage_map.get(stage)
         return {"stage": stage, "persona_id": persona_id}
@@ -589,6 +505,8 @@ class PersonaProgressionPlugin(BasePlugin):
         if not self.enabled or self.persona_scope != "session":
             return
         session_id = event.sid
+        if not self._is_session_enabled(session_id):
+            return
         stage = self.state_mgr.get_stage(session_id, self.initial_stage)
         persona_id = self.stage_map.get(stage)
         if not persona_id:
@@ -619,3 +537,156 @@ class PersonaProgressionPlugin(BasePlugin):
             ))
             if self.enable_debug_log:
                 logger.debug("已创建新的 persona prompt (阶段 %d)", stage)
+
+
+class _PersonaGetStageTool(BaseTool):
+    name = "persona_get_stage"
+    description = "获取当前会话的人格阶段"
+    parameters = {"type": "object", "properties": {}}
+
+    def __init__(self, ctx, plugin):
+        self.ctx = ctx
+        self.plugin = plugin
+
+    async def execute(self, event: KiraMessageBatchEvent, *_) -> str:
+        if not self.plugin.state_mgr:
+            return "插件未初始化"
+        session_id = event.sid
+        if not self.plugin._is_session_enabled(session_id):
+            return "该会话未启用人格进阶插件"
+        stage = self.plugin.state_mgr.get_stage(session_id, self.plugin.initial_stage)
+        return f"当前阶段：{stage} / {self.plugin.total_stages - 1}"
+
+
+class _PersonaSetStageTool(BaseTool):
+    name = "persona_set_stage"
+    description = "手动设置当前会话的人格阶段"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "stage": {"type": "integer", "description": "目标阶段（0 ~ max）"}
+        },
+        "required": ["stage"]
+    }
+
+    def __init__(self, ctx, plugin):
+        self.ctx = ctx
+        self.plugin = plugin
+
+    async def execute(self, event: KiraMessageBatchEvent, *_, stage: int) -> str:
+        if not self.plugin.state_mgr:
+            return "插件未初始化"
+        if not self.plugin._check_permission(event):
+            return self.plugin.permission_denied_message
+
+        session_id = event.sid
+        if not self.plugin._is_session_enabled(session_id):
+            return "该会话未启用人格进阶插件"
+        if stage < 0 or stage >= self.plugin.total_stages:
+            return f"阶段必须在 0 ~ {self.plugin.total_stages - 1} 之间"
+        old = self.plugin.state_mgr.get_stage(session_id, self.plugin.initial_stage)
+        ok = await self.plugin._change_stage(session_id, stage)
+        if ok:
+            if self.plugin.reset_on_manual:
+                self.plugin.state_mgr.reset_turn_counter(session_id)
+            if self.plugin.enable_debug_log:
+                logger.debug("工具 set_stage: %s 阶段 %d -> %d", session_id, old, stage)
+            return self.plugin.success_message.format(action="设置", stage=stage)
+        else:
+            return self.plugin.error_message.format(error="设置失败，请检查人格映射")
+
+
+class _PersonaAdvanceTool(BaseTool):
+    name = "persona_advance"
+    description = "手动将当前会话阶段提升一级"
+    parameters = {"type": "object", "properties": {}}
+
+    def __init__(self, ctx, plugin):
+        self.ctx = ctx
+        self.plugin = plugin
+
+    async def execute(self, event: KiraMessageBatchEvent, *_) -> str:
+        if not self.plugin.state_mgr:
+            return "插件未初始化"
+        if not self.plugin._check_permission(event):
+            return self.plugin.permission_denied_message
+
+        session_id = event.sid
+        if not self.plugin._is_session_enabled(session_id):
+            return "该会话未启用人格进阶插件"
+        current = self.plugin.state_mgr.get_stage(session_id, self.plugin.initial_stage)
+        if current >= self.plugin.total_stages - 1:
+            return self.plugin.max_stage_message.format(
+                max_stage=self.plugin.total_stages - 1,
+                current_stage=current
+            )
+        new = current + 1
+        ok = await self.plugin._change_stage(session_id, new)
+        if ok:
+            if self.plugin.reset_on_manual:
+                self.plugin.state_mgr.reset_turn_counter(session_id)
+            if self.plugin.enable_debug_log:
+                logger.debug("工具 advance: %s 阶段 %d -> %d", session_id, current, new)
+            return self.plugin.success_message.format(action="进阶", stage=new)
+        else:
+            return self.plugin.error_message.format(error="升级失败，请检查人格映射")
+
+
+class _PersonaDecayTool(BaseTool):
+    name = "persona_decay"
+    description = "手动将当前会话阶段降低一级"
+    parameters = {"type": "object", "properties": {}}
+
+    def __init__(self, ctx, plugin):
+        self.ctx = ctx
+        self.plugin = plugin
+
+    async def execute(self, event: KiraMessageBatchEvent, *_) -> str:
+        if not self.plugin.state_mgr:
+            return "插件未初始化"
+        if not self.plugin._check_permission(event):
+            return self.plugin.permission_denied_message
+
+        session_id = event.sid
+        if not self.plugin._is_session_enabled(session_id):
+            return "该会话未启用人格进阶插件"
+        current = self.plugin.state_mgr.get_stage(session_id, self.plugin.initial_stage)
+        if current <= 0:
+            return self.plugin.min_stage_message.format(
+                min_stage=0,
+                current_stage=current
+            )
+        new = current - 1
+        ok = await self.plugin._change_stage(session_id, new)
+        if ok:
+            if self.plugin.reset_on_manual:
+                self.plugin.state_mgr.reset_turn_counter(session_id)
+            if self.plugin.enable_debug_log:
+                logger.debug("工具 decay: %s 阶段 %d -> %d", session_id, current, new)
+            return self.plugin.success_message.format(action="降级", stage=new)
+        else:
+            return self.plugin.error_message.format(error="降级失败，请检查人格映射")
+
+
+class _PersonaResetCounterTool(BaseTool):
+    name = "persona_reset_counter"
+    description = "重置当前会话的轮数计数器（不影响阶段）"
+    parameters = {"type": "object", "properties": {}}
+
+    def __init__(self, ctx, plugin):
+        self.ctx = ctx
+        self.plugin = plugin
+
+    async def execute(self, event: KiraMessageBatchEvent, *_) -> str:
+        if not self.plugin.state_mgr:
+            return "插件未初始化"
+        if not self.plugin._check_permission(event):
+            return self.plugin.permission_denied_message
+
+        session_id = event.sid
+        if not self.plugin._is_session_enabled(session_id):
+            return "该会话未启用人格进阶插件"
+        self.plugin.state_mgr.reset_turn_counter(session_id)
+        if self.plugin.enable_debug_log:
+            logger.debug("工具 reset_counter: %s 计数器已重置", session_id)
+        return "轮数计数器已重置"
