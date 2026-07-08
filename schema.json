@@ -42,6 +42,12 @@
         "name": "启用调试日志",
         "default": false,
         "hint": "开启后输出详细的轮数、AI判断、人格切换日志，便于排查问题。"
+      },
+      "enabled_sessions": {
+        "type": "list",
+        "name": "启用的会话",
+        "default": [],
+        "hint": "每行一个完整会话 ID，如 qq:dm:123456、qq:gm:789012。留空则对所有会话启用。"
       }
     }
   },
@@ -146,12 +152,6 @@
         "default": ["/消级", "/清数"],
         "hint": "匹配任意关键词即重置 turn_counter（不影响阶段）"
       },
-      "enable_tool": {
-        "type": "switch",
-        "name": "启用工具调用",
-        "default": true,
-        "hint": "注册人格管理相关工具（查询/设置/进阶/降级/重置计数等），允许 LLM 通过自然语言调用"
-      },
       "reset_on_manual": {
         "type": "switch",
         "name": "手动切换重置轮数",
@@ -171,6 +171,12 @@
     "name": "权限控制与反馈",
     "collapsed": true,
     "fields": {
+      "enable_tool": {
+        "type": "switch",
+        "name": "启用 AI 工具调用",
+        "default": true,
+        "hint": "开启后，主 LLM 将在工具列表中看到人格阶段相关工具（查询/设置/进阶/降级/重置计数），可通过自然语言调用。关闭后，主 LLM 不会知道人格阶段机制的存在，仅能通过关键词或额外LLM控制。"
+      },
       "enable_permission": {
         "type": "switch",
         "name": "启用权限控制",
