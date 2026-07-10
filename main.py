@@ -39,6 +39,7 @@ class PersonaProgressionPlugin(BasePlugin):
         self.judge_prompt = ""
         self.ignore_tool = True
         self.ignore_assistant = False
+        self.include_reasoning_content = False
 
         # 衰退配置
         self.enable_decay = False
@@ -132,6 +133,7 @@ class PersonaProgressionPlugin(BasePlugin):
         self.enable_ai = trigger.get("enable_ai_judge", True)
         self.ignore_tool = trigger.get("ignore_tool_messages", True)
         self.ignore_assistant = trigger.get("ignore_assistant_messages", False)
+        self.include_reasoning_content = trigger.get("include_reasoning_content", False)
         aux_model_uuid = trigger.get("auxiliary_model", "")
         if aux_model_uuid:
             self.aux_model = self.ctx.get_llm_client(model_uuid=aux_model_uuid)
@@ -283,7 +285,8 @@ class PersonaProgressionPlugin(BasePlugin):
         conversation_text = self.trigger_engine.build_conversation_text(
             history,
             ignore_tool=self.ignore_tool,
-            ignore_assistant=self.ignore_assistant
+            ignore_assistant=self.ignore_assistant,
+            include_reasoning=self.include_reasoning_content
         )
         if self.enable_debug_log:
             logger.debug("发送给辅助LLM的对话文本长度: %d 字符", len(conversation_text))
