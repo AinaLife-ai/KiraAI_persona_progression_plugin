@@ -87,6 +87,12 @@
         "name": "忽略助手回复消息",
         "default": false,
         "hint": "发送给辅助 LLM 时，不包含助手纯文本回复，仅保留用户消息（极端节省 token）。"
+      },
+      "include_reasoning_content": {
+        "type": "switch",
+        "name": "包含主 LLM 思考链",
+        "default": false,
+        "hint": "发送给辅助 LLM 时，是否包含主 LLM 的 reasoning_content（思考链）。开启后判断依据更充分，但会消耗更多 token。"
       }
     }
   },
