@@ -218,6 +218,7 @@
 | `辅助 LLM 模型` | 推荐选择快速模型 |
 | `忽略工具调用消息` | 判断时不包含工具消息，节省 token |
 | `忽略助手回复消息` | 判断时只保留用户消息（极端省 token） |
+| `包含主 LLM 思考链` | 开启后额外 LLM 可读取主 LLM 的 reasoning_content |
 
 #### 手动控制
 
@@ -358,6 +359,9 @@ A：是的，这是设计如此。该功能会调用 `delete_session` 清除历�
 
 <details>
 <summary>点击展开</summary>
+
+#### v1.1.5
+- 新增 `include_reasoning_content` 开关，可控制辅助 LLM 是否读取主 LLM 思考链。
 
 #### v1.1.0
 - 新增 `enabled_sessions` 会话白名单，支持限制仅特定会话启用插件。
