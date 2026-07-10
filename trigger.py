@@ -50,22 +50,30 @@ class TriggerEngine:
             logger.exception("切换全局人格失败: %s", e)
             return False
 
-    def build_conversation_text(self, messages: List[dict], ignore_tool: bool, ignore_assistant: bool) -> str:
+    def build_conversation_text(self, messages: List[dict], ignore_tool: bool, ignore_assistant: bool, include_reasoning: bool = False) -> str:
         """根据裁剪配置构建发给辅助 LLM 的对话文本"""
         lines = []
         for msg in messages:
             role = msg.get("role", "")
             content = msg.get("content", "")
+            reasoning = msg.get("reasoning_content", "") if include_reasoning else ""
             if ignore_tool and role in ("tool", "function"):
                 continue
             if ignore_assistant and role == "assistant":
                 continue
+
+            parts = []
             if role == "tool":
-                lines.append(f"[工具结果] {content}")
+                parts.append(f"[工具结果] {content}")
             elif role == "assistant":
-                lines.append(f"助手：{content}")
+                parts.append(f"助手：{content}")
             elif role == "user":
-                lines.append(f"用户：{content}")
+                parts.append(f"用户：{content}")
             else:
-                lines.append(f"{role}: {content}")
+                parts.append(f"{role}: {content}")
+
+            if reasoning:
+                parts.append(f"[思考过程] {reasoning}")
+
+            lines.append("\n".join(parts))
         return "\n".join(lines)
