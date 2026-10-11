@@ -13,7 +13,10 @@
         "type": "enum",
         "name": "人格与阶段作用域",
         "default": "session",
-        "options": ["global", "session"],
+        "options": [
+          "global",
+          "session"
+        ],
         "hint": "global：所有会话共用阶段进度和激活人格（切换全局激活人格）；session：每个会话独立阶段进度和人格（动态注入，推荐）"
       },
       "total_stages": {
@@ -69,12 +72,13 @@
         "default": true,
         "hint": "关闭后，达到间隔轮数不会自动切换，仅重置计数，需手动调用工具或关键词触发。"
       },
-      "auxiliary_model": {
-        "type": "model_select",
+      "auxiliary_models": {
+        "type": "multi_select",
+        "source": "model",
         "model_type": "llm",
-        "name": "辅助 LLM 模型",
-        "default": "",
-        "hint": "用于语义判断的模型，留空则使用默认快速模型。"
+        "name": "辅助 LLM 模型组（有序回退）",
+        "default": [],
+        "hint": "从已注册的模型里按点击顺序选 1~10 个：第 1 个为主力，失败时自动换下一个。留空则用默认快速模型。旧版单选配置会在升级后首次启动时自动迁移进本组（第 1 档）。"
       },
       "ignore_tool_messages": {
         "type": "switch",
@@ -143,19 +147,28 @@
       "advance_keywords": {
         "type": "list",
         "name": "进阶关键词",
-        "default": ["/进阶", "/升级"],
+        "default": [
+          "/进阶",
+          "/升级"
+        ],
         "hint": "匹配任意关键词即触发进阶（不分大小写）"
       },
       "decay_keywords": {
         "type": "list",
         "name": "降级关键词",
-        "default": ["/降级", "/退阶"],
+        "default": [
+          "/降级",
+          "/退阶"
+        ],
         "hint": "匹配任意关键词即触发降级"
       },
       "clear_keywords": {
         "type": "list",
         "name": "清空计数关键词",
-        "default": ["/消级", "/清数"],
+        "default": [
+          "/消级",
+          "/清数"
+        ],
         "hint": "匹配任意关键词即重置 turn_counter（不影响阶段）"
       },
       "reset_on_manual": {
@@ -224,6 +237,66 @@
         "name": "已达最低阶段回复消息",
         "default": "⚠️ 已达最低阶段（{min_stage}），无法继续降级",
         "hint": "尝试降级但已处于最低阶段时回复的消息，可用占位符：{min_stage}, {current_stage}"
+      }
+    }
+  },
+  "section_jev": {
+    "type": "section",
+    "name": "JEV 决策引擎（可选 · 更省更快）",
+    "collapsed": true,
+    "fields": {
+      "jev_enabled": {
+        "type": "switch",
+        "name": "启用 JEV 决策引擎",
+        "default": false,
+        "hint": "开启后，up/down/stay 判断优先走 TypeSafe JEV（System-One）决策模型：不生成文本、直接给出选项+概率+置信度，成本约为生成式辅助 LLM 的 1/10~1/100，延迟 70~500ms。默认关闭，行为与旧版完全一致。"
+      },
+      "jev_models": {
+        "type": "multi_select",
+        "source": "model",
+        "model_type": "llm",
+        "name": "JEV 模型组（推荐 · 有序回退）",
+        "default": [],
+        "hint": "先在「设置 → 提供商」把 JEV 当中转提供商注册（接口地址+密钥，加一个叫 jev-latest 的模型），然后在这里按点击顺序挑选 1~10 个：接口地址/密钥/模型名自动继承，失败自动换下一个。留空则用下方手动填写的地址与密钥。"
+      },
+      "jev_base_url": {
+        "type": "string",
+        "name": "JEV 接口地址（手动兜底）",
+        "default": "https://api.typesafe.ai",
+        "hint": "上方模型组为空时才用这里。官方 https://api.typesafe.ai；官方在部分地区不可用（HTTP 451）时可填中转站地址。支持粘贴 .../v1、.../v1/systemone 等完整地址，插件自动规整。"
+      },
+      "jev_api_key": {
+        "type": "string",
+        "name": "JEV API 密钥（手动兜底）",
+        "default": "",
+        "hint": "上方模型组为空时才用这里。支持 $$环境变量名 形式。"
+      },
+      "jev_model_name": {
+        "type": "string",
+        "name": "JEV 模型名（手动兜底）",
+        "default": "jev-latest",
+        "hint": "上方模型组为空时才用这里。官方别名 jev-latest 或固定版本号如 jev-1.13.0。"
+      },
+      "jev_timeout_ms": {
+        "type": "integer",
+        "name": "JEV 超时（毫秒）",
+        "default": 4000,
+        "minimum": 500,
+        "hint": "单次 JEV 判断的硬超时；超时按失败处理并计入熔断。"
+      },
+      "jev_min_confidence": {
+        "type": "integer",
+        "name": "JEV 置信门槛（%）",
+        "default": 0,
+        "minimum": 0,
+        "maximum": 100,
+        "hint": "置信度低于该值时保守取 stay（不切换）。0 = 不启用门控（推荐起步），观察日志后再调。"
+      },
+      "jev_fallback_llm": {
+        "type": "switch",
+        "name": "JEV 失败回退辅助 LLM",
+        "default": true,
+        "hint": "开启后，JEV 失败/熔断时自动改用辅助 LLM 完成本次判断（更稳）；关闭则 JEV 失败时本次按 stay 处理（更省）。"
       }
     }
   }

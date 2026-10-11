@@ -1,5 +1,7 @@
 from __future__ import annotations
 import asyncio
+import json
+import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from core.plugin import BasePlugin, logger, on, Priority, register
@@ -13,6 +15,13 @@ from core.utils.tool_utils import BaseTool
 
 from .state_manager import StateManager
 from .trigger import TriggerEngine
+from .jev import (JevConfig, endpoint_of, DEFAULT_BASE_URL, DEFAULT_MODEL,
+                  _pick, _env, _BASE_KEYS, _KEY_KEYS, split_ref)
+
+#: 人格内容缓存 TTL（秒）：人格编辑最多这么久生效；阶段切换时主动失效
+PERSONA_CACHE_TTL = 60.0
+#: 缺失人格告警去重窗口（秒）：同一人格 id 最多这么久 warn 一次（防刷屏）
+PERSONA_WARN_INTERVAL = 600.0
 
 
 class PersonaProgressionPlugin(BasePlugin):
@@ -28,6 +37,7 @@ class PersonaProgressionPlugin(BasePlugin):
         self.persona_scope = "session"
         self.total_stages = 5
         self.stage_map: Dict[int, str] = {}
+        self.stage_names: Dict[int, str] = {}   # 阶段 → 人格可读名（展示用，映射仍以 stage_map 为准）
         self.initial_stage = 0
         self.enable_debug_log = False
         self.enabled_sessions: List[str] = []
@@ -36,10 +46,18 @@ class PersonaProgressionPlugin(BasePlugin):
         self.trigger_interval = 10
         self.enable_ai = True
         self.aux_model = None
+        self.aux_model_uuid = ""
+        self.aux_model_display = "默认快速模型"
+        self.aux_clients: List[tuple] = []       # [(ref, client)] 有序回退链
+        self.jev_link_displays: List[str] = []   # JEV 链可读描述（不含密钥）
         self.judge_prompt = ""
         self.ignore_tool = True
         self.ignore_assistant = False
         self.include_reasoning_content = False
+
+        # JEV 决策引擎（可选，默认关闭 ⇒ 行为与 v1.1.5 完全一致）
+        self.jev_config = JevConfig(enabled=False)
+        self.jev_client = None
 
         # 衰退配置
         self.enable_decay = False
@@ -52,7 +70,7 @@ class PersonaProgressionPlugin(BasePlugin):
         self.clear_keywords: List[str] = []
         self.enable_tool = True
         self.reset_on_manual = False
-        self.clear_context_on_switch = False  # ✅ 新增
+        self.clear_context_on_switch = False
 
         # 权限与反馈配置
         self.enable_permission = False
@@ -63,11 +81,23 @@ class PersonaProgressionPlugin(BasePlugin):
         self.max_stage_message = "⚠️ 已达最大阶段（{max_stage}），无法继续进阶"
         self.min_stage_message = "⚠️ 已达最低阶段（{min_stage}），无法继续降级"
 
+        # 运行时：后台判断（不堵消息管线）
+        self._trigger_locks: Dict[str, asyncio.Lock] = {}
+        self._trigger_tasks: set = set()
+        # 运行时：人格内容缓存 / 缺失告警去重
+        self._persona_cache: Dict[str, tuple] = {}   # persona_id -> (PersonaInfo, ts)
+        self._persona_warned: Dict[str, float] = {}  # persona_id -> last warn ts
+
     async def initialize(self):
         self.data_dir = self.ctx.get_plugin_data_dir()
         if self.data_dir is None:
             logger.error("无法获取插件数据目录")
             return
+
+        # 一次性配置迁移：旧单选 auxiliary_model → auxiliary_models 第 1 档
+        # （就地合并自己负责的键，不经框架 update_plugin_config —— 它会重启插件，
+        #   初始化期调用会递归；幂等：旧键清空后不再触发）
+        self._migrate_aux_chain()
 
         cfg = self.plugin_cfg
 
@@ -80,18 +110,26 @@ class PersonaProgressionPlugin(BasePlugin):
         self.enable_debug_log = basic.get("enable_debug_log", False)
         self.enabled_sessions = [s.strip() for s in basic.get("enabled_sessions", []) if s.strip()]
 
+        if self.initial_stage < 0 or self.initial_stage >= max(1, self.total_stages):
+            logger.warning("初始阶段 %d 超出范围（0 ~ %d），将按 0 处理",
+                           self.initial_stage, self.total_stages - 1)
+            self.initial_stage = 0
+
         self.persona_mgr = self.ctx.persona_mgr
         all_personas = await self.persona_mgr.list_personas()
         persona_lookup: Dict[str, str] = {}
+        persona_names: Dict[str, str] = {}
         for p in all_personas:
             persona_lookup[p.id] = p.id
             if p.name:
                 persona_lookup[p.name] = p.id
+                persona_names[p.id] = p.name
         if self.enable_debug_log:
             logger.debug(f"人格查找表: {persona_lookup}")
 
         raw_map = basic.get("stage_persona_map", [])
         self.stage_map = {}
+        self.stage_names = {}
         if isinstance(raw_map, list):
             for entry in raw_map:
                 if not entry or not entry.strip():
@@ -109,6 +147,9 @@ class PersonaProgressionPlugin(BasePlugin):
                 if not identifier:
                     logger.warning(f"人格标识为空: {entry}")
                     continue
+                if stage < 0 or stage >= self.total_stages:
+                    logger.warning(f"阶段 {stage} 超出范围（0 ~ {self.total_stages - 1}），已忽略: {entry}")
+                    continue
                 real_id = persona_lookup.get(identifier)
                 if not real_id:
                     logger.warning(f"找不到人格标识 '{identifier}'，请检查名称或ID是否正确")
@@ -116,6 +157,7 @@ class PersonaProgressionPlugin(BasePlugin):
                 if stage in self.stage_map:
                     logger.warning(f"阶段 {stage} 被重复定义，新值 {real_id} 将覆盖旧值 {self.stage_map[stage]}")
                 self.stage_map[stage] = real_id
+                self.stage_names[stage] = persona_names.get(real_id, real_id)
                 if self.enable_debug_log:
                     logger.debug(f"映射阶段 {stage} -> 人格ID {real_id} (来自标识 '{identifier}')")
         else:
@@ -126,6 +168,10 @@ class PersonaProgressionPlugin(BasePlugin):
             missing = [str(i) for i in range(self.total_stages) if i not in self.stage_map]
             if missing:
                 logger.warning(f"以下阶段未配置人格映射: {', '.join(missing)}")
+            mapping_desc = ", ".join(
+                f"{s}→「{self.stage_names.get(s, self.stage_map[s])}」" for s in sorted(self.stage_map)
+            )
+            logger.info("阶段人格映射: %s", mapping_desc)
 
         # 触发设置
         trigger = cfg.get("section_trigger", {})
@@ -134,18 +180,67 @@ class PersonaProgressionPlugin(BasePlugin):
         self.ignore_tool = trigger.get("ignore_tool_messages", True)
         self.ignore_assistant = trigger.get("ignore_assistant_messages", False)
         self.include_reasoning_content = trigger.get("include_reasoning_content", False)
-        aux_model_uuid = trigger.get("auxiliary_model", "")
-        if aux_model_uuid:
-            self.aux_model = self.ctx.get_llm_client(model_uuid=aux_model_uuid)
-        else:
-            self.aux_model = self.ctx.get_default_fast_llm_client()
+        # 辅助模型组（有序回退；迁移后旧单选已在组内第 1 档）
+        aux_refs = [str(m).strip() for m in (trigger.get("auxiliary_models") or [])
+                    if str(m).strip()][:10]
+        self.aux_clients = []
+        for ref in aux_refs:
+            client = self.ctx.get_llm_client(model_uuid=ref)
+            if client:
+                self.aux_clients.append((ref, client))
+            else:
+                logger.warning("辅助模型组：%s 不可达（提供商/模型已删除？），已跳过",
+                               self._model_display(ref))
+        if not aux_refs:
+            default_client = self.ctx.get_default_fast_llm_client()
+            if default_client:
+                self.aux_clients.append(("", default_client))
+        self.aux_model = self.aux_clients[0][1] if self.aux_clients else None
+        self.aux_model_uuid = self.aux_clients[0][0] if self.aux_clients else ""
+        self.aux_model_display = self._model_display(self.aux_model_uuid) if self.aux_model_uuid else "默认快速模型"
         if not self.aux_model:
             logger.warning("辅助 LLM 不可用，AI 判断将失效")
             self.enable_ai = False
+        elif len(self.aux_clients) == 1:
+            logger.info("辅助判断模型: %s", self.aux_model_display)
+        else:
+            logger.info("辅助模型组（%d 档有序回退）: %s", len(self.aux_clients),
+                        " → ".join(self._model_display(ref) if ref else "默认快速模型"
+                                   for ref, _ in self.aux_clients))
 
         # AI 判断提示词
         ai_section = cfg.get("section_ai", {})
         self.judge_prompt = ai_section.get("judge_prompt", "")
+
+        # JEV 决策引擎（可选）
+        jev_sec = cfg.get("section_jev", {}) or {}
+        try:
+            timeout_ms = float(jev_sec.get("jev_timeout_ms", 4000) or 4000)
+        except (TypeError, ValueError):
+            timeout_ms = 4000
+        try:
+            min_conf = float(jev_sec.get("jev_min_confidence", 0) or 0) / 100.0
+        except (TypeError, ValueError):
+            min_conf = 0.0
+        jev_links, self.jev_link_displays = self._resolve_jev_links(jev_sec)
+        self.jev_config = JevConfig(
+            enabled=jev_sec.get("jev_enabled", False),
+            links=jev_links,
+            timeout=timeout_ms / 1000.0,
+            min_confidence=min_conf,
+            fallback_llm=jev_sec.get("jev_fallback_llm", True),
+        )
+        self.jev_client = self.jev_config.client(logger) if self.jev_config.ready else None
+        if self.jev_config.enabled:
+            if self.jev_client:
+                logger.info("JEV 决策引擎已启用（%d 档有序回退，超时 %.1fs，置信门槛 %.2f，失败回退辅助LLM: %s）: %s",
+                            len(self.jev_config.links), self.jev_config.timeout,
+                            self.jev_config.min_confidence,
+                            "开" if self.jev_config.fallback_llm else "关",
+                            " → ".join(self.jev_link_displays))
+            else:
+                logger.warning("JEV 已启用但没有可用连接——请在「JEV 模型组」挑选已注册的模型，"
+                               "或手动填写接口地址与密钥")
 
         # 衰退机制
         decay = cfg.get("section_decay", {})
@@ -159,7 +254,7 @@ class PersonaProgressionPlugin(BasePlugin):
         self.decay_keywords = [kw.strip().lower() for kw in manual.get("decay_keywords", ["/降级", "/退阶"]) if kw.strip()]
         self.clear_keywords = [kw.strip().lower() for kw in manual.get("clear_keywords", ["/消级", "/清数"]) if kw.strip()]
         self.reset_on_manual = manual.get("reset_on_manual", False)
-        self.clear_context_on_switch = manual.get("clear_context_on_switch", False)  # ✅ 新增
+        self.clear_context_on_switch = manual.get("clear_context_on_switch", False)
 
         # 权限与反馈
         perm = cfg.get("section_permission", {})
@@ -174,7 +269,11 @@ class PersonaProgressionPlugin(BasePlugin):
 
         # 初始化状态管理器
         self.state_mgr = StateManager(self.data_dir, self.persona_scope)
-        self.trigger_engine = TriggerEngine(self.persona_mgr, self.aux_model if self.enable_ai else None)
+        self.trigger_engine = TriggerEngine(
+            self.persona_mgr,
+            self.aux_model if self.enable_ai else None,
+            llm_clients=[c for _, c in self.aux_clients] if self.enable_ai else None,
+        )
 
         if self.persona_scope == "global":
             g_state = self.state_mgr.get_state("global")
@@ -189,7 +288,154 @@ class PersonaProgressionPlugin(BasePlugin):
                     "启用" if self.clear_context_on_switch else "禁用")
 
     async def terminate(self):
+        if self.state_mgr:
+            self.state_mgr.flush(force=True)
         logger.info("人设进阶系统终止")
+
+    # ---------- 配置迁移 ----------
+    def _migrate_aux_chain(self):
+        """一次性迁移：旧单选 auxiliary_model → auxiliary_models 第 1 档。
+
+        · 幂等：旧键清空后不再触发；
+        · 只动 section_trigger 里自己负责的两个键（读当前段→改→写回整段）；
+        · 不经框架 update_plugin_config（它会重启插件 ⇒ 初始化期调用会递归），
+          改为「同步管理器内存缓存 + 直接落盘」（路径与框架一致：
+          data/config/plugins/<plugin_id>.json）；
+        · 写盘失败不影响本次运行（读侧已合并），下轮启动自动重试。
+        """
+        try:
+            trig = self.plugin_cfg.get("section_trigger") or {}
+            if not isinstance(trig, dict):
+                return
+            legacy = str(trig.get("auxiliary_model") or "").strip()
+            if not legacy:
+                return
+            chain = [str(m).strip() for m in (trig.get("auxiliary_models") or [])
+                     if str(m).strip()]
+            if not chain:
+                chain = [legacy]
+            trig_new = dict(trig)
+            trig_new["auxiliary_models"] = chain
+            trig_new.pop("auxiliary_model", None)   # 移除旧键（防配置膨胀）
+            # 内存配置即时生效（本次启动）
+            self.plugin_cfg["section_trigger"] = trig_new
+            pid = "kira_persona_progression"
+            # 同步管理器缓存（保持 webui 读写一致）
+            mgr = getattr(self.ctx, "plugin_mgr", None)
+            if mgr is not None and isinstance(getattr(mgr, "plugin_configs", None), dict):
+                full = dict(mgr.plugin_configs.get(pid) or self.plugin_cfg)
+                full["section_trigger"] = trig_new
+                mgr.plugin_configs[pid] = full
+            # 落盘（与框架同路径同格式）
+            from core.utils.path_utils import get_config_path
+            cfg_dir = get_config_path() / "plugins"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            cfg_file = cfg_dir / f"{pid}.json"
+            disk = {}
+            if cfg_file.exists():
+                try:
+                    disk = json.loads(cfg_file.read_text(encoding="utf-8"))
+                except Exception:
+                    disk = {}
+            if not isinstance(disk, dict):
+                disk = {}
+            disk["section_trigger"] = trig_new
+            cfg_file.write_text(json.dumps(disk, ensure_ascii=False, indent=4), encoding="utf-8")
+            logger.info("配置迁移：辅助模型旧单选已并入模型组（第 1 档：%s），旧键已移除",
+                        self._model_display(legacy))
+        except Exception as e:
+            logger.warning("辅助模型配置迁移写盘失败（不影响本次运行，下次启动重试）: %s", e)
+
+    # ---------- JEV 连接链解析 ----------
+    def _resolve_jev_links(self, jev_sec: dict):
+        """jev_models（已注册提供商模型多选）→ [(base, key, model)]；显式字段作最后兜底。
+
+        返回 (links, displays)。displays 只含可读名与端点主机，**绝不含密钥**。
+        """
+        links = []
+        displays = []
+        refs = jev_sec.get("jev_models") or []
+        if not isinstance(refs, list):
+            refs = []
+        for ref in refs[:10]:
+            ref = str(ref).strip()
+            if not ref:
+                continue
+            pid, mid = split_ref(ref)
+            if not pid or not mid:
+                continue
+            try:
+                info = self.ctx.provider_mgr.get_model_info(pid, mid)
+            except Exception:
+                info = None
+            if not info:
+                logger.warning("JEV 模型组：%s 无法解析（提供商/模型已删除？），跳过", ref)
+                continue
+            conf = getattr(info, "provider_config", None) or {}
+            base = _pick(conf, _BASE_KEYS)
+            key = _env(_pick(conf, _KEY_KEYS))
+            # 上游模型名：3.0 用 model_name；2.x 用 model_id 键
+            model = getattr(info, "model_name", None) or getattr(info, "model_id", "") or mid
+            if not base or not key:
+                logger.warning("JEV 模型组：%s 缺少接口地址或密钥，跳过",
+                               self._model_display(ref))
+                continue
+            if (base, key, model) in links:
+                continue
+            links.append((base, key, model))
+            host = base.split("://", 1)[-1].split("/", 1)[0]
+            displays.append(f"{self._model_display(ref)} ⇒ {model}@{host}")
+        # 显式手动兜底（密钥非空才成链）
+        exp_key = str(jev_sec.get("jev_api_key") or "").strip()
+        if exp_key:
+            base = str(jev_sec.get("jev_base_url") or "").strip() or DEFAULT_BASE_URL
+            model = str(jev_sec.get("jev_model_name") or "").strip() or DEFAULT_MODEL
+            link = (base, exp_key, model)
+            if link not in links:
+                links.append(link)
+                host = base.split("://", 1)[-1].split("/", 1)[0]
+                displays.append(f"手动 ⇒ {model}@{host}")
+        return links, displays
+
+    # ---------- 展示辅助 ----------
+    def _model_display(self, model_uuid: str) -> str:
+        """`provider:model` → '可读名 (提供商名)'；解析失败返回原值（绝不空白）。
+
+        3.0 的 model_id 是 uuid 串、可读名在 model_name（含 legacy_ids 解析）；
+        2.x 的可读名就是 model_id 键。
+        """
+        if not model_uuid:
+            return "默认快速模型"
+        try:
+            pid, _, mid = model_uuid.partition(":")
+            if not pid or not mid:
+                return model_uuid
+            info = self.ctx.provider_mgr.get_model_info(pid, mid)
+            if info:
+                name = getattr(info, "model_name", None) or getattr(info, "model_id", "") or mid
+                provider = getattr(info, "provider_name", "") or pid
+                return f"{name} ({provider})"
+        except Exception:
+            pass
+        return model_uuid
+
+    def _persona_display(self, persona_id: str) -> str:
+        """人格 id → '名称 (id)' 或原 id。"""
+        if not persona_id:
+            return "(未配置)"
+        try:
+            cached = self._persona_cache.get(persona_id)
+            if cached and getattr(cached[0], "name", None):
+                return f"{cached[0].name} ({persona_id})"
+        except Exception:
+            pass
+        for stage, pid in self.stage_map.items():
+            if pid == persona_id:
+                name = self.stage_names.get(stage)
+                if name and name != persona_id:
+                    return f"{name} ({persona_id})"
+                break
+        return persona_id
 
     def _check_permission(self, event) -> bool:
         """检查触发事件的用户是否在允许列表中"""
@@ -239,17 +485,15 @@ class PersonaProgressionPlugin(BasePlugin):
             if ok:
                 self.state_mgr.set_stage(session_id, new_stage)
                 if self.enable_debug_log:
-                    logger.debug("全局人格切换至阶段 %d，人格ID: %s", new_stage, persona_id)
-                # ✅ 新增：切换成功后清除上下文（全局模式也支持，按会话清除）
+                    logger.debug("全局人格切换至阶段 %d，人格: %s", new_stage, self._persona_display(persona_id))
                 if self.clear_context_on_switch:
                     await self._clear_session_context(session_id)
             return ok
         else:
             self.state_mgr.set_stage(session_id, new_stage)
             if self.enable_debug_log:
-                logger.debug("会话 %s 阶段 %d → %d (session 人格待注入，人格ID: %s)",
-                             session_id, current, new_stage, persona_id)
-            # ✅ 新增：切换成功后清除上下文
+                logger.debug("会话 %s 阶段 %d → %d (session 人格待注入，人格: %s)",
+                             session_id, current, new_stage, self._persona_display(persona_id))
             if self.clear_context_on_switch:
                 await self._clear_session_context(session_id)
             return True
@@ -267,6 +511,63 @@ class PersonaProgressionPlugin(BasePlugin):
                 logger.debug("已清除会话上下文: %s", session_id)
         except Exception as e:
             logger.warning("清除会话上下文失败 (%s): %s", session_id, e)
+
+    # ---------- 后台判断（不堵消息管线） ----------
+    def _schedule_trigger(self, session_id: str):
+        """达到间隔 → 后台执行判断；同一会话已有判断在飞则跳过（计数保留，不重置）。
+
+        v1.1.5 在消息事件里同步 await 辅助 LLM（一次 1~30s），会拖住该会话的消息管线；
+        改为 create_task 后台跑 + 每会话锁防重入。
+        """
+        lock = self._trigger_locks.setdefault(session_id, asyncio.Lock())
+        if lock.locked():
+            if self.enable_debug_log:
+                logger.debug("会话 %s 上一次判断仍在进行，跳过本次调度", session_id)
+            return
+        task = asyncio.create_task(self._run_trigger(session_id, lock))
+        self._trigger_tasks.add(task)
+        task.add_done_callback(self._trigger_tasks.discard)
+
+    async def _run_trigger(self, session_id: str, lock: asyncio.Lock):
+        async with lock:
+            try:
+                await self._process_trigger(session_id)
+            except Exception as e:
+                logger.warning("后台判断异常 (%s): %s", session_id, e)
+
+    async def _decide(self, session_id: str, current_stage: int, conversation_text: str) -> str:
+        """统一判断入口：JEV 优先（便宜快速）→ 失败按配置回退辅助 LLM → stay。
+
+        JEV 未启用时与 v1.1.5 逐字等价（只走辅助 LLM）。
+        """
+        max_stage = self.total_stages - 1
+        # 1) JEV 决策引擎
+        if self.jev_client is not None:
+            instructions = self.trigger_engine.render_jev_instructions(
+                self.judge_prompt, current_stage, max_stage)
+            result = await self.jev_client.decide(conversation_text, instructions)
+            if result is not None:
+                if self.enable_debug_log:
+                    logger.debug("JEV 判断: %s (置信 %.2f, 概率 %s, 模型 %s)",
+                                 result["choice"], result["confidence"],
+                                 result.get("probabilities"), result.get("model"))
+                if result["confidence"] < self.jev_config.min_confidence:
+                    if self.enable_debug_log:
+                        logger.debug("JEV 置信 %.2f 低于门槛 %.2f，保守取 stay",
+                                     result["confidence"], self.jev_config.min_confidence)
+                    return "stay"
+                return result["choice"]
+            # JEV 失败/熔断：按配置回退
+            if not self.jev_config.fallback_llm:
+                return "stay"
+        # 2) 辅助 LLM（JEV 未启用时的原路径）
+        if self.enable_ai and self.aux_model:
+            decision = await self.trigger_engine.judge(
+                self.judge_prompt, current_stage, max_stage, conversation_text)
+            if self.enable_debug_log:
+                logger.debug("AI 判断结果: %s", decision)
+            return decision
+        return "stay"
 
     async def _process_trigger(self, session_id: str):
         if not self.trigger_engine:
@@ -289,33 +590,21 @@ class PersonaProgressionPlugin(BasePlugin):
             include_reasoning=self.include_reasoning_content
         )
         if self.enable_debug_log:
-            logger.debug("发送给辅助LLM的对话文本长度: %d 字符", len(conversation_text))
+            logger.debug("发送给判断引擎的对话文本长度: %d 字符", len(conversation_text))
 
-        if self.enable_ai and self.aux_model:
-            decision = await self.trigger_engine.judge(
-                self.judge_prompt,
-                current_stage,
-                self.total_stages - 1,
-                conversation_text
-            )
-            if self.enable_debug_log:
-                logger.debug("AI 判断结果: %s", decision)
-        else:
-            decision = "stay"
-            if self.enable_debug_log:
-                logger.debug("AI 判断未启用，默认 stay")
+        decision = await self._decide(session_id, current_stage, conversation_text)
 
         new_stage = current_stage
         if decision == "up" and current_stage < self.total_stages - 1:
             new_stage = current_stage + 1
             self.state_mgr.set_consecutive_stay(session_id, 0)
             if self.enable_debug_log:
-                logger.debug("AI 决定升级，新阶段 %d", new_stage)
+                logger.debug("判断决定升级，新阶段 %d", new_stage)
         elif decision == "down" and current_stage > 0:
             new_stage = current_stage - 1
             self.state_mgr.set_consecutive_stay(session_id, 0)
             if self.enable_debug_log:
-                logger.debug("AI 决定降级，新阶段 %d", new_stage)
+                logger.debug("判断决定降级，新阶段 %d", new_stage)
         else:
             if self.enable_decay:
                 stay_count = self.state_mgr.get_consecutive_stay(session_id) + 1
@@ -328,7 +617,7 @@ class PersonaProgressionPlugin(BasePlugin):
                     logger.info("连续保持 %d 次，触发衰退降级至阶段 %d", stay_count, new_stage)
             else:
                 if self.enable_debug_log:
-                    logger.debug("AI 决定保持，且衰退未启用")
+                    logger.debug("判断决定保持，且衰退未启用")
 
         if new_stage != current_stage:
             await self._change_stage(session_id, new_stage)
@@ -349,14 +638,15 @@ class PersonaProgressionPlugin(BasePlugin):
         if not self._is_session_enabled(session_id):
             return
         self.state_mgr.increment_turn(session_id)
+        self.state_mgr.flush()  # 防抖兜底：最多 30s 落一次盘，热路径零阻塞
         turn = self.state_mgr.get_turn_counter(session_id)
         if self.enable_debug_log:
             logger.debug("会话 %s 当前轮数: %d / %d", session_id, turn, self.trigger_interval)
 
         if turn >= self.trigger_interval:
             if self.enable_debug_log:
-                logger.debug("达到触发间隔，开始检测")
-            await self._process_trigger(session_id)
+                logger.debug("达到触发间隔，调度后台判断")
+            self._schedule_trigger(session_id)
 
     # ---------- 手动控制：关键词拦截 ----------
     @on.im_message(priority=Priority.HIGH)
@@ -480,7 +770,7 @@ class PersonaProgressionPlugin(BasePlugin):
             return {"error": "session not enabled"}
         try:
             stage = int(stage)
-        except:
+        except (TypeError, ValueError):
             return {"error": "stage must be integer"}
         if stage < 0 or stage >= self.total_stages:
             return {"error": f"stage must be 0~{self.total_stages-1}"}
@@ -500,9 +790,73 @@ class PersonaProgressionPlugin(BasePlugin):
             return {"error": "session not enabled"}
         stage = self.state_mgr.get_stage(session_id, self.initial_stage)
         persona_id = self.stage_map.get(stage)
-        return {"stage": stage, "persona_id": persona_id}
+        return {
+            "stage": stage,
+            "persona_id": persona_id,
+            "persona_name": self.stage_names.get(stage, persona_id),
+        }
+
+    @register.api(method="GET", path="/status", auth=True)
+    async def api_status(self) -> dict:
+        """插件状态总览：模型与人格全部给可读名（uuid 仅存不用作显示）。"""
+        if not self.state_mgr:
+            return {"error": "not initialized"}
+        jev_info = {
+            "enabled": self.jev_config.enabled,
+            "ready": bool(self.jev_client and self.jev_client.ready),
+            "links": [
+                {"model": m, "endpoint": endpoint_of(b)} for b, _, m in self.jev_config.links
+            ],
+            "links_display": list(self.jev_link_displays),
+            "fallback_llm": self.jev_config.fallback_llm,
+            "min_confidence": self.jev_config.min_confidence,
+        }
+        if self.jev_client:
+            jev_info.update({
+                "calls": self.jev_client.calls,
+                "input_tokens": self.jev_client.tokens,
+                "cooldown_left": self.jev_client.cooldown_left,
+                "last_error": self.jev_client.last_error,
+            })
+        return {
+            "enabled": self.enabled,
+            "scope": self.persona_scope,
+            "total_stages": self.total_stages,
+            "initial_stage": self.initial_stage,
+            "trigger_interval": self.trigger_interval,
+            "stage_map": {
+                str(s): {"persona_id": pid, "persona_name": self.stage_names.get(s, pid)}
+                for s, pid in sorted(self.stage_map.items())
+            },
+            "aux_model": self.aux_model_display,
+            "aux_model_uuid": self.aux_model_uuid or "",
+            "aux_chain": [
+                {"ref": ref, "name": self._model_display(ref) if ref else "默认快速模型"}
+                for ref, _ in self.aux_clients
+            ],
+            "ai_judge_enabled": self.enable_ai,
+            "jev": jev_info,
+            "judging_sessions": [sid for sid, lock in self._trigger_locks.items() if lock.locked()],
+        }
 
     # ---------- session 模式人格注入 ----------
+    async def _get_persona_cached(self, persona_id: str):
+        """人格查询带 60s 缓存（人格编辑最多 60s 生效；阶段切换不经过此缓存键变更）。"""
+        now = time.monotonic()
+        cached = self._persona_cache.get(persona_id)
+        if cached and (now - cached[1]) < PERSONA_CACHE_TTL:
+            return cached[0]
+        info = await self.persona_mgr.get_persona(persona_id)
+        if info:
+            self._persona_cache[persona_id] = (info, now)
+        else:
+            # 缺人格不缓存（可能正在创建），但告警去重防刷屏
+            last = self._persona_warned.get(persona_id, 0.0)
+            if now - last > PERSONA_WARN_INTERVAL:
+                self._persona_warned[persona_id] = now
+                logger.warning("人格 ID '%s' 不存在，无法注入", persona_id)
+        return info
+
     @on.llm_request(priority=Priority.SYS_HIGH)
     async def inject_session_persona(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
         if not self.enabled or self.persona_scope != "session":
@@ -516,20 +870,21 @@ class PersonaProgressionPlugin(BasePlugin):
             if self.enable_debug_log:
                 logger.debug("阶段 %d 未配置人格映射，跳过注入", stage)
             return
-        persona_info = await self.persona_mgr.get_persona(persona_id)
+        persona_info = await self._get_persona_cached(persona_id)
         if not persona_info:
-            logger.warning("人格 ID '%s' 不存在，无法注入", persona_id)
             return
         persona_text = persona_info.content
 
         if self.enable_debug_log:
-            logger.debug("注入人格: %s (阶段 %d), 内容长度: %d", persona_id, stage, len(persona_text))
+            logger.debug("注入人格: %s (阶段 %d), 内容长度: %d",
+                         self._persona_display(persona_id), stage, len(persona_text))
 
         for p in req.system_prompt:
             if p.name == "persona":
                 p.kwargs["persona"] = persona_text
                 if self.enable_debug_log:
-                    logger.debug("已注入 session 人格到 kwargs: %s (阶段 %d)", persona_id, stage)
+                    logger.debug("已注入 session 人格到 kwargs: %s (阶段 %d)",
+                                 self._persona_display(persona_id), stage)
                 break
         else:
             req.system_prompt.append(Prompt(
