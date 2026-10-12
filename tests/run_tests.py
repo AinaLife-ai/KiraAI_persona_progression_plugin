@@ -75,12 +75,17 @@ def extract_baseline(repo_root, plugin_dir):
                 return None     # 基线即当前版（对拍无意义）
             tmp = tempfile.mkdtemp(prefix="kpp_baseline_")
             ok = True
-            for f in ("main.py", "state_manager.py", "trigger.py", "manifest.json", "schema.json"):
+            # 必需文件缺失 ⇒ 该 ref 不可用；可选文件（jev.py 等后加的）缺失容忍
+            for f, required in (("main.py", True), ("state_manager.py", True),
+                                 ("trigger.py", True), ("manifest.json", True),
+                                 ("jev.py", False), ("schema.json", False)):
                 r = subprocess.run(["git", "-C", str(repo_root), "show", f"{ref}:{f}"],
                                    capture_output=True, timeout=15)
                 if r.returncode != 0:
-                    ok = False
-                    break
+                    if required:
+                        ok = False
+                        break
+                    continue
                 open(os.path.join(tmp, f), "wb").write(r.stdout)
             if ok:
                 print(f"  （对拍基线：{ref} v{base_ver}）", flush=True)
@@ -221,9 +226,35 @@ class StubPersonaMgr:
 
 
 class StubSessionMgr:
+    """2.x / 3.0-alpha 形态：同步 fetch_memory/write_memory/delete_session/get_session_info。"""
+
     def __init__(self):
         self.memory = {}
         self.deleted = []
+        self.written = []          # [(sid, memory)] write_memory 记录
+
+    def fetch_memory(self, sid):
+        return list(self.memory.get(sid, []))
+
+    def write_memory(self, sid, memory):
+        self.written.append((sid, memory))
+        self.memory[sid] = [list(memory)] if memory else []
+
+    def delete_session(self, sid):
+        self.deleted.append(sid)
+        self.memory.pop(sid, None)
+
+    def get_session_info(self, sid):
+        return types.SimpleNamespace(sid=sid)
+
+
+class StubSessionMgrOldest:
+    """最老兜底形态：只有 fetch_memory + delete_session + get_session_info（无清空类 API）。"""
+
+    def __init__(self):
+        self.memory = {}
+        self.deleted = []
+        self.recreated = []
 
     def fetch_memory(self, sid):
         return list(self.memory.get(sid, []))
@@ -233,7 +264,50 @@ class StubSessionMgr:
         self.memory.pop(sid, None)
 
     def get_session_info(self, sid):
+        self.recreated.append(sid)
         return types.SimpleNamespace(sid=sid)
+
+
+class _RC1Session:
+    """3.0 rc.1 的 Session 最小形态：content 为分块，flatten_content() 拍平。"""
+
+    def __init__(self, chunks):
+        self.content = chunks
+
+    def flatten_content(self):
+        return [m for chunk in self.content for m in chunk]
+
+
+class StubSessionMgrRC1:
+    """3.0 rc.1 形态：SQLite 异步化。**故意没有** fetch_memory / write_memory / get_session_info。"""
+
+    _UNSET = object()
+
+    def __init__(self):
+        self.memory = {}
+        self.deleted = []
+        self.recreated = []
+        self.updated = []          # [(sid, content)] update_session 记录
+
+    async def get_session(self, sid, *, ensure_session=False, include_content=True):
+        chunks = self.memory.get(sid)
+        if chunks is None:
+            if not ensure_session:
+                return None
+            self.memory[sid] = []
+            self.recreated.append(sid)
+            chunks = []
+        return _RC1Session([list(chunks)])  # 内存里是扁平列表 ⇒ 包成单块
+
+    async def update_session(self, sid, *, title=None, description=None,
+                             content=None, data=None):
+        if content is not None:
+            self.updated.append((sid, content))
+            self.memory[sid] = [m for c in content for m in c] if content else []
+
+    async def delete_session(self, sid):
+        self.deleted.append(sid)
+        self.memory.pop(sid, None)
 
 
 class StubMsgProc:
@@ -937,6 +1011,80 @@ async def run_gen_suite(gen, pkg, mod):
     writes = "已落盘(防抖内正常)" if m1 > m0 else "零落盘"
     check("1000 批事件平均 < 1ms", el_loop / 1000 < 0.001, f"{el_loop/1000*1000:.3f}ms/批, {writes}")
     check("事件循环未被堵（1000 批+后台收尾 < 3s）", el < 3.0, f"{el:.2f}s")
+    await plugin.terminate()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---------- 22b. 版本声明与未来形态 ----------
+    section(f"[{gen}] core_version 声明与未来形态")
+    import json as _json
+    man = _json.loads(open(os.path.join(_PLUGIN_DIR_CURRENT, "manifest.json"), encoding="utf-8").read())
+    check("manifest 声明 core_version", man.get("core_version") == ">=2.24.3", str(man.get("core_version")))
+    from packaging.version import Version
+    from packaging.specifiers import SpecifierSet
+    spec = SpecifierSet(man["core_version"], prereleases=True)
+    ok_list = ["2.24.3", "2.34.8", "3.0.0a4", "3.0.0rc1", "3.0.0", "3.1.0", "4.0.0"]
+    check("声明放行 2.24.3+/3.0 全系/未来版本", all(Version(v) in spec for v in ok_list))
+    check("声明拦截过旧版本", Version("2.24.2") not in spec and Version("2.0.0") not in spec)
+
+    class _FutureSessionMgr:
+        """假想未来形态：fetch_memory 与 get_session 都不存在。"""
+
+        async def delete_session(self, sid):
+            pass
+
+    plugin, ctx, tmp = await make_plugin(gen, pkg, mod, aux_llm=StubLLM(replies=["up"]))
+    plugin.ctx.session_mgr = _FutureSessionMgr()
+    plugin.state_mgr.set_turn_counter("s1", 3)
+    # 生产路径（_run_trigger 兜底）：异常不得冒出、阶段不得误变
+    await plugin._run_trigger("s1", __import__("asyncio").Lock())
+    check("未来未知形态：判断异常被兜底不外冒", True)
+    check("未来未知形态：阶段不误变", plugin.state_mgr.get_stage("s1", 0) == 0)
+    await plugin.terminate()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---------- 22. 3.0 rc.1 会话管理器形态适配（异步 SQLite 化） ----------
+    section(f"[{gen}] 3.0rc1 会话形态适配（fetch_memory 移除/delete 异步化）")
+    plugin, ctx, tmp = await make_plugin(gen, pkg, mod, aux_llm=StubLLM(replies=["up"]))
+    rc1 = StubSessionMgrRC1()
+    rc1.memory["s1"] = [{"role": "user", "content": "早"}, {"role": "assistant", "content": "早呀"}]
+    plugin.ctx.session_mgr = rc1
+    mem = await plugin._fetch_memory("s1")
+    check("rc1 形态读记忆（flatten_content）", len(mem) == 2 and mem[0]["content"] == "早", str(mem)[:60])
+    check("rc1 无会话返回空列表", await plugin._fetch_memory("nope") == [])
+    # 完整判断链路走 rc1 形态
+    plugin.state_mgr.set_turn_counter("s1", 3)
+    await plugin._process_trigger("s1")
+    check("rc1 形态完整判断链路（阶段+1）", plugin.state_mgr.get_stage("s1", 0) == 1)
+    # 清空上下文（三代择优）：rc1 走 update_session(content=[]) 保留会话本身
+    plugin.clear_context_on_switch = True
+    await plugin._change_stage("s1", 2)
+    check("rc1 清空走 update_session(content=[])",
+          rc1.updated and rc1.updated[-1] == ("s1", []), str(rc1.updated))
+    check("rc1 不再走删除+重建", "s1" not in rc1.deleted and "s1" not in rc1.recreated)
+    check("rc1 清空后读记忆为空", await plugin._fetch_memory("s1") == [])
+    await plugin.terminate()
+    shutil.rmtree(tmp, ignore_errors=True)
+    # 旧形态（2.x/alpha）：走 write_memory([]) 保留会话记录
+    plugin, ctx, tmp = await make_plugin(gen, pkg, mod)
+    plugin.clear_context_on_switch = True
+    ctx.session_mgr.memory["s1"] = [{"role": "user", "content": "早"}]
+    await plugin._change_stage("s1", 1)
+    check("旧形态清空走 write_memory([])",
+          ctx.session_mgr.written and ctx.session_mgr.written[-1] == ("s1", []),
+          str(ctx.session_mgr.written))
+    check("旧形态不再走删除", "s1" not in ctx.session_mgr.deleted)
+    check("旧形态清空后读记忆为空", ctx.session_mgr.fetch_memory("s1") == [])
+    await plugin.terminate()
+    shutil.rmtree(tmp, ignore_errors=True)
+    # 最老兜底形态（无清空 API）：仍能 delete+重建
+    plugin, ctx, tmp = await make_plugin(gen, pkg, mod)
+    plugin.clear_context_on_switch = True
+    oldest = StubSessionMgrOldest()
+    oldest.memory["s1"] = [{"role": "user", "content": "早"}]
+    plugin.ctx.session_mgr = oldest
+    await plugin._change_stage("s1", 1)
+    check("最老兜底：delete+重建仍可用",
+          "s1" in oldest.deleted and "s1" in oldest.recreated)
     await plugin.terminate()
     shutil.rmtree(tmp, ignore_errors=True)
     if _cfg_file.exists():
