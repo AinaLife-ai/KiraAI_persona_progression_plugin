@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import inspect
 import json
 import time
 from pathlib import Path
@@ -498,17 +499,61 @@ class PersonaProgressionPlugin(BasePlugin):
                 await self._clear_session_context(session_id)
             return True
 
+    # ---------- 会话管理器双世代适配（2.x/3.0a4 同步 JSON ⇄ 3.0rc1+ 异步 SQLite） ----------
+    async def _fetch_memory(self, session_id: str) -> list:
+        """读会话记忆（扁平消息列表）。3.0 rc.1 起 fetch_memory 移除，
+        改为 get_session(...).flatten_content()（SQLite 持久化，异步）。"""
+        sm = self.ctx.session_mgr
+        if sm is None:
+            return []
+        if hasattr(sm, "fetch_memory"):
+            return sm.fetch_memory(session_id) or []
+        # 3.0 rc.1+：异步 SQLite 形态
+        sess = await sm.get_session(session_id, ensure_session=False)
+        if sess is None:
+            return []
+        return sess.flatten_content()
+
+    async def _delete_and_recreate_session(self, session_id: str) -> None:
+        """删除并重建会话（清除上下文用）。delete_session 在 3.0 rc.1 起变为异步。"""
+        sm = self.ctx.session_mgr
+        result = sm.delete_session(session_id)
+        if inspect.isawaitable(result):
+            await result
+        # 重新初始化会话（重建空记忆）
+        if hasattr(sm, "get_session_info"):
+            sm.get_session_info(session_id)
+        else:
+            # 3.0 rc.1+：ensure_session=True 不存在则建空会话
+            await sm.get_session(session_id, ensure_session=True)
+
     async def _clear_session_context(self, session_id: str) -> None:
-        """清除会话上下文记忆（参考 reboot 插件实现）"""
+        """清空会话上下文（**只清对话内容，会话本身的标题/能力设置等元数据保留**）。
+
+        三代适配（按能力择优，特征识别而非版本号）：
+          · 3.0 rc.1+：`update_session(sid, content=[])`（SQLite 异步，发
+            session_memory_written 事件，记录保留）；
+          · 2.x / 3.0-alpha：`write_memory(sid, [])`（同步，会话记录保留）；
+          · 更老兜底：delete + 重建（v1.1.5 原行为）。
+        """
         try:
-            if self.ctx.session_mgr is None:
+            sm = self.ctx.session_mgr
+            if sm is None:
                 logger.warning("SessionManager 不可用，无法清除上下文")
                 return
-            self.ctx.session_mgr.delete_session(session_id)
-            # 重新初始化会话（重建空记忆）
-            self.ctx.session_mgr.get_session_info(session_id)
+            if hasattr(sm, "update_session"):
+                # 3.0 rc.1+：SQLite 形态，清空 content 保留会话元数据/能力
+                await sm.update_session(session_id, content=[])
+            elif hasattr(sm, "write_memory"):
+                # 2.x / 3.0-alpha：清空 memory 块，会话记录保留
+                result = sm.write_memory(session_id, [])
+                if inspect.isawaitable(result):
+                    await result
+            else:
+                # 最老形态兜底：删除+重建
+                await self._delete_and_recreate_session(session_id)
             if self.enable_debug_log:
-                logger.debug("已清除会话上下文: %s", session_id)
+                logger.debug("已清空会话上下文（会话本身保留）: %s", session_id)
         except Exception as e:
             logger.warning("清除会话上下文失败 (%s): %s", session_id, e)
 
@@ -576,7 +621,7 @@ class PersonaProgressionPlugin(BasePlugin):
         if self.enable_debug_log:
             logger.debug("触发检测: session=%s, 当前阶段=%d", session_id, current_stage)
 
-        history = self.ctx.session_mgr.fetch_memory(session_id)
+        history = await self._fetch_memory(session_id)
         max_history = 50
         if len(history) > max_history:
             history = history[-max_history:]
