@@ -1,6 +1,6 @@
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_persona_progression_plugin)
 
-## KiraAI_persona_progression(KPP)/人设动态切换系统1.2.1
+## KiraAI_persona_progression(KPP)/人设动态切换系统1.2.2
 
 > 让 AI 拥有“动态变化人格” —— 在对话中根据轮数和语义判断自动切换人格，实现角色成长、觉醒、黑化、失忆等动态叙事体验。
 
@@ -388,6 +388,10 @@ A：是的，这是设计如此。该功能会调用 `delete_session` 清除历�
 
 <details>
 <summary>点击展开</summary>
+
+#### v1.2.2
+
+- 兼容 KiraAI 3.0 GA 弃用面：3 处 `ctx.message_processor.send_message_chain` → `ctx.send_message_chain`（两代等价）。测试桩补 ctx 级发送委托；2.x/3.0 GA 250 用例通过。
 
 #### v1.2.1
 - **清空上下文语义优化**：从「删除会话重建」改为「仅清空对话内容」（rc.1 走 `update_session(content=[])`，2.x/alpha 走 `write_memory([])`，更老版本兜底删除重建）——会话标题与能力设置不再被误伤。

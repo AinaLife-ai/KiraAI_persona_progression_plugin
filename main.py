@@ -713,7 +713,7 @@ class PersonaProgressionPlugin(BasePlugin):
             self.state_mgr.reset_turn_counter(session_id)
             if self.enable_debug_log:
                 logger.debug("会话 %s 清空计数关键词触发", session_id)
-            await self.ctx.message_processor.send_message_chain(
+            await self.ctx.send_message_chain(
                 session=session_id,
                 chain=MessageChain([Text("✅ 已清空轮数计数器")])
             )
@@ -736,7 +736,7 @@ class PersonaProgressionPlugin(BasePlugin):
         if action:
             # 权限检查
             if not self._check_permission(event):
-                await self.ctx.message_processor.send_message_chain(
+                await self.ctx.send_message_chain(
                     session=session_id,
                     chain=MessageChain([Text(self.permission_denied_message)])
                 )
@@ -771,7 +771,7 @@ class PersonaProgressionPlugin(BasePlugin):
                 else:
                     reply = "⚠️ 阶段未变化"
 
-            await self.ctx.message_processor.send_message_chain(
+            await self.ctx.send_message_chain(
                 session=session_id,
                 chain=MessageChain([Text(reply)])
             )
