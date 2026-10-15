@@ -383,6 +383,11 @@ class StubCtx:
         from pathlib import Path
         return Path(self._dir)
 
+    # 镜像真 PluginContext：ctx 级发送就是委托给 message_processor（GA 起 message_processor
+    # 侧同名方法已弃用，插件应调这里）
+    async def send_message_chain(self, session, chain, **kw):
+        return await self.message_processor.send_message_chain(session, chain, **kw)
+
     def get_llm_client(self, model_uuid=None, llm_type=None):
         return self._llm_map.get(model_uuid or "")
 
